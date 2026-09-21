@@ -1,18 +1,18 @@
 package com.example.myapplication
 
-import androidx.annotation.OptIn
-import androidx.camera.core.ExperimentalGetImage
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.OptIn
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -36,20 +36,26 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.navigation.NavController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.room.*
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.koin.android.ext.koin.androidContext
 import org.koin.androidx.compose.koinViewModel
 import org.koin.androidx.viewmodel.dsl.viewModel
+import org.koin.core.context.GlobalContext
 import org.koin.core.context.startKoin
 import org.koin.dsl.module
 import retrofit2.Retrofit
@@ -59,33 +65,103 @@ import retrofit2.http.Path
 import java.util.concurrent.Executors
 
 // ==========================================
-// 1. DATA MODELS
+// 1. ROOM DB (Реляционная БД)
 // ==========================================
 
-data class VehicleProfile(
+@Entity(tableName = "vehicles")
+data class VehicleEntity(
+    @PrimaryKey val vin: String,
     val brand: String,
     val model: String,
-    val year: String = "",
-    val engine: String = "",
-    val vin: String,
+    val year: String,
+    val engine: String,
     val licensePlate: String,
     val currentMileageKm: Int
 )
+
+@Entity(tableName = "service_history")
+data class ServiceHistoryEntity(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val vehicleVin: String,
+    val title: String,
+    val date: String,
+    val mileageKm: Int,
+    val cost: Double
+)
+
+@Dao
+interface VehicleDao {
+    @Query("SELECT * FROM vehicles LIMIT 1")
+    suspend fun getActiveVehicle(): VehicleEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertVehicle(vehicle: VehicleEntity)
+
+    @Query("SELECT * FROM service_history WHERE vehicleVin = :vin ORDER BY mileageKm DESC")
+    suspend fun getHistoryForVehicle(vin: String): List<ServiceHistoryEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertHistoryItem(item: ServiceHistoryEntity)
+}
+
+@Database(entities = [VehicleEntity::class, ServiceHistoryEntity::class], version = 1, exportSchema = false)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun vehicleDao(): VehicleDao
+}
+
+// ==========================================
+// 2. NoSQL DOCUMENT STORE (Заводские техкарты)
+// ==========================================
+
+data class FactoryMaintenanceCard(
+    val cardId: String,
+    val brand: String,
+    val intervalKm: Int,
+    val serviceTitle: String,
+    val consumables: String
+)
+
+class NoSqlDocumentStore(context: Context, private val gson: Gson) {
+    private val prefs = context.getSharedPreferences("nosql_tech_cards", Context.MODE_PRIVATE)
+
+    fun saveCards(cards: List<FactoryMaintenanceCard>) {
+        val json = gson.toJson(cards)
+        prefs.edit().putString("tech_cards_json", json).apply()
+    }
+
+    fun getCardsByBrand(brand: String): List<FactoryMaintenanceCard> {
+        val json = prefs.getString("tech_cards_json", null) ?: return emptyList()
+        val type = object : TypeToken<List<FactoryMaintenanceCard>>() {}.type
+        val allCards: List<FactoryMaintenanceCard> = gson.fromJson(json, type) ?: emptyList()
+        return allCards.filter { it.brand.equals(brand, ignoreCase = true) }
+    }
+
+    fun isEmpty(): Boolean {
+        return !prefs.contains("tech_cards_json")
+    }
+}
+
+// ==========================================
+// 3. RETROFIT API (NHTSA API)
+// ==========================================
+
+data class NhtsaResponse(val Results: List<NhtsaResult>)
+data class NhtsaResult(val Variable: String?, val Value: String?)
+
+interface NhtsaApiService {
+    @GET("api/vehicles/decodevin/{vin}?format=json")
+    suspend fun decodeVin(@Path("vin") vin: String): NhtsaResponse
+}
+
+// ==========================================
+// 4. DATA MODELS & UI STATES
+// ==========================================
 
 data class ServiceTask(
     val id: String,
     val title: String,
     val dueMileageKm: Int,
-    val dueDate: String,
-    val isCompleted: Boolean = false
-)
-
-data class ServiceHistoryItem(
-    val id: String,
-    val title: String,
-    val date: String,
-    val mileageKm: Int,
-    val cost: Double
+    val consumables: String
 )
 
 data class CostCategory(
@@ -96,63 +172,95 @@ data class CostCategory(
 
 data class DashboardUiState(
     val isLoading: Boolean = false,
-    val vehicle: VehicleProfile? = null,
+    val vehicle: VehicleEntity? = null,
     val upcomingServices: List<ServiceTask> = emptyList(),
-    val serviceHistory: List<ServiceHistoryItem> = emptyList(),
+    val serviceHistory: List<ServiceHistoryEntity> = emptyList(),
     val monthlyExpenses: List<CostCategory> = emptyList(),
     val errorMessage: String? = null
 )
 
 // ==========================================
-// 2. RETROFIT API (NHTSA API)
+// 5. REPOSITORY
 // ==========================================
 
-data class NhtsaResponse(
-    val Results: List<NhtsaResult>
-)
+class AutoRepository(
+    private val apiService: NhtsaApiService,
+    private val db: AppDatabase,
+    private val noSqlStore: NoSqlDocumentStore
+) {
+    suspend fun getActiveVehicle(): VehicleEntity? = db.vehicleDao().getActiveVehicle()
 
-data class NhtsaResult(
-    val Variable: String?,
-    val Value: String?
-)
+    suspend fun getHistory(vin: String): List<ServiceHistoryEntity> = db.vehicleDao().getHistoryForVehicle(vin)
 
-interface NhtsaApiService {
-    @GET("api/vehicles/decodevin/{vin}?format=json")
-    suspend fun decodeVin(@Path("vin") vin: String): NhtsaResponse
-}
-
-class VehicleRepository(private val apiService: NhtsaApiService) {
-    suspend fun decodeVin(vin: String): VehicleProfile? {
-        return try {
+    suspend fun decodeAndSaveVin(vin: String): VehicleEntity? = withContext(Dispatchers.IO) {
+        try {
             val response = apiService.decodeVin(vin)
             val results = response.Results
 
-            val make = results.firstOrNull { it.Variable == "Make" }?.Value ?: "Unknown"
-            val model = results.firstOrNull { it.Variable == "Model" }?.Value ?: "Unknown"
-            val year = results.firstOrNull { it.Variable == "Model Year" }?.Value ?: ""
-            val engine = results.firstOrNull { it.Variable == "Displacement (L)" }?.Value ?: ""
+            val make = results.firstOrNull { it.Variable == "Make" }?.Value ?: "Toyota"
+            val model = results.firstOrNull { it.Variable == "Model" }?.Value ?: "Camry"
+            val year = results.firstOrNull { it.Variable == "Model Year" }?.Value ?: "2021"
+            val engine = results.firstOrNull { it.Variable == "Displacement (L)" }?.Value ?: "2.5L"
 
-            VehicleProfile(
+            val vehicle = VehicleEntity(
+                vin = vin,
                 brand = make,
                 model = model,
                 year = year,
-                engine = if (engine.isNotBlank()) "$engine L" else "2.5L",
-                vin = vin,
-                licensePlate = "A 123 BC 777",
-                currentMileageKm = 45200
+                engine = if (engine.endsWith("L")) engine else "$engine L",
+                licensePlate = "A 777 AA 777",
+                currentMileageKm = 45000
             )
+
+            db.vehicleDao().insertVehicle(vehicle)
+            vehicle
         } catch (e: Exception) {
             e.printStackTrace()
             null
         }
     }
+
+    fun getMaintenanceCards(brand: String): List<FactoryMaintenanceCard> {
+        return noSqlStore.getCardsByBrand(brand)
+    }
+
+    suspend fun seedNoSqlIfEmpty() = withContext(Dispatchers.IO) {
+        if (noSqlStore.isEmpty()) {
+            val initialCards = listOf(
+                FactoryMaintenanceCard(
+                    cardId = "card_1",
+                    brand = "Toyota",
+                    intervalKm = 10000,
+                    serviceTitle = "Замена масла в ДВС и масляного фильтра",
+                    consumables = "Масло 0W-20 4.5л, Фильтр масляный, Прокладка пробки"
+                ),
+                FactoryMaintenanceCard(
+                    cardId = "card_2",
+                    brand = "Toyota",
+                    intervalKm = 20000,
+                    serviceTitle = "Замена салонного и воздушного фильтров",
+                    consumables = "Фильтр салона угольный, Фильтр воздушный ДВС"
+                ),
+                FactoryMaintenanceCard(
+                    cardId = "card_3",
+                    brand = "Toyota",
+                    intervalKm = 40000,
+                    serviceTitle = "Замена тормозной жидкости и свечей",
+                    consumables = "Тормозная жидкость DOT4 1л, Свечи зажигания 4шт"
+                )
+            )
+            noSqlStore.saveCards(initialCards)
+        }
+    }
 }
 
 // ==========================================
-// 3. KOIN DI MODULES
+// 6. KOIN DI MODULES
 // ==========================================
 
 val appModule = module {
+    single { Gson() }
+
     single {
         Retrofit.Builder()
             .baseUrl("https://vpic.nhtsa.dot.gov/")
@@ -160,96 +268,97 @@ val appModule = module {
             .build()
             .create(NhtsaApiService::class.java)
     }
-    single { VehicleRepository(get()) }
+
+    single {
+        Room.databaseBuilder(get<Context>(), AppDatabase::class.java, "auto_assistant.db")
+            .fallbackToDestructiveMigration()
+            .build()
+    }
+
+    single { NoSqlDocumentStore(get(), get()) }
+
+    single { AutoRepository(get(), get(), get()) }
     viewModel { AutoAssistantViewModel(get()) }
 }
 
 // ==========================================
-// 4. VIEW MODEL
+// 7. VIEW MODEL
 // ==========================================
 
-class AutoAssistantViewModel(private val repository: VehicleRepository) : ViewModel() {
+class AutoAssistantViewModel(private val repository: AutoRepository) : ViewModel() {
 
     private val _uiState = MutableStateFlow(DashboardUiState())
     val uiState: StateFlow<DashboardUiState> = _uiState.asStateFlow()
 
     init {
-        loadMockData()
+        viewModelScope.launch {
+            repository.seedNoSqlIfEmpty()
+            loadData()
+        }
     }
 
-    private fun loadMockData() {
-        _uiState.update {
-            DashboardUiState(
-                isLoading = false,
-                vehicle = VehicleProfile(
-                    brand = "Toyota",
-                    model = "Camry",
-                    year = "2021",
-                    engine = "2.5L",
-                    vin = "4T1B11HK8MW123456",
-                    licensePlate = "A 123 BC 777",
-                    currentMileageKm = 45200
-                ),
-                upcomingServices = listOf(
-                    ServiceTask("1", "Замена масла в ДВС и фильтров", 50000, "15.11.2026"),
-                    ServiceTask("2", "Замена передних тормозных колодок", 52000, "01.12.2026"),
-                    ServiceTask("3", "Диагностика ходовой части", 55000, "20.01.2027")
-                ),
-                serviceHistory = listOf(
-                    ServiceHistoryItem("h1", "Замена свечей зажигания", "12.05.2026", 40000, 4500.0),
-                    ServiceHistoryItem("h2", "Замена тормозной жидкости", "10.01.2026", 35000, 3200.0),
-                    ServiceHistoryItem("h3", "ТО-3 (Масло + фильтры)", "15.08.2025", 30000, 9500.0)
-                ),
-                monthlyExpenses = listOf(
-                    CostCategory("Топливо", 12500.0, 0xFF4CAF50),
-                    CostCategory("Обслуживание", 8000.0, 0xFF2196F3),
-                    CostCategory("Мойка/Детейлинг", 2500.0, 0xFFFF9800),
-                    CostCategory("Парковка", 1200.0, 0xFF9C27B0)
+    private suspend fun loadData() {
+        val vehicle = repository.getActiveVehicle() ?: repository.decodeAndSaveVin("4T1B11HK8MW123456")
+
+        if (vehicle != null) {
+            val history = repository.getHistory(vehicle.vin)
+            val cards = repository.getMaintenanceCards(vehicle.brand)
+
+            val upcomingTasks = cards.map { card ->
+                ServiceTask(
+                    id = card.cardId,
+                    title = card.serviceTitle,
+                    dueMileageKm = vehicle.currentMileageKm + card.intervalKm,
+                    consumables = card.consumables
                 )
+            }
+
+            val mockExpenses = listOf(
+                CostCategory("Топливо", 12500.0, 0xFF4CAF50),
+                CostCategory("Обслуживание", 8000.0, 0xFF2196F3),
+                CostCategory("Мойка/Детейлинг", 2500.0, 0xFFFF9800),
+                CostCategory("Парковка", 1200.0, 0xFF9C27B0)
             )
+
+            _uiState.update {
+                it.copy(
+                    vehicle = vehicle,
+                    upcomingServices = upcomingTasks,
+                    serviceHistory = history,
+                    monthlyExpenses = mockExpenses
+                )
+            }
         }
     }
 
     fun onVinScanned(vin: String) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
-            val decodedVehicle = repository.decodeVin(vin)
+            val decodedVehicle = repository.decodeAndSaveVin(vin)
 
             if (decodedVehicle != null) {
-                // Автоматическая генерация плана замен (Техкарта)
-                val generatedTasks = listOf(
-                    ServiceTask("gen_1", "Базовое ТО (${decodedVehicle.brand})", decodedVehicle.currentMileageKm + 8000, "10.12.2026"),
-                    ServiceTask("gen_2", "Проверка свечей (${decodedVehicle.engine})", decodedVehicle.currentMileageKm + 15000, "15.03.2027")
-                )
-
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        vehicle = decodedVehicle,
-                        upcomingServices = generatedTasks,
-                        errorMessage = null
-                    )
-                }
+                loadData()
+                _uiState.update { it.copy(isLoading = false, errorMessage = null) }
             } else {
-                _uiState.update {
-                    it.copy(isLoading = false, errorMessage = "Не удалось декодировать VIN")
-                }
+                _uiState.update { it.copy(isLoading = false, errorMessage = "Не удалось декодировать VIN") }
             }
         }
     }
 }
 
 // ==========================================
-// 5. MAIN ACTIVITY & NAVIGATION
+// 8. MAIN ACTIVITY & UI
 // ==========================================
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Инициализация Koin
-        startKoin {
-            modules(appModule)
+        if (GlobalContext.getOrNull() == null) {
+            startKoin {
+                androidContext(this@MainActivity)
+                modules(appModule)
+            }
         }
 
         setContent {
@@ -294,10 +403,6 @@ fun AppNavigation() {
         }
     }
 }
-
-// ==========================================
-// 6. DASHBOARD SCREEN
-// ==========================================
 
 @Composable
 fun MainDashboardScreen(
@@ -356,17 +461,14 @@ fun MainDashboardScreen(
 
             item {
                 Text(
-                    text = "Предстоящее обслуживание",
+                    text = "Заводские техкарты (NoSQL Хранилище)",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold
                 )
             }
 
             items(state.upcomingServices) { service ->
-                ServiceTaskCard(
-                    task = service,
-                    currentMileage = state.vehicle?.currentMileageKm ?: 0
-                )
+                ServiceTaskCard(task = service)
             }
 
             item {
@@ -382,175 +484,8 @@ fun MainDashboardScreen(
     }
 }
 
-// ==========================================
-// 7. VIN SCANNER SCREEN (ML KIT + CAMERAX)
-// ==========================================
-
 @Composable
-fun VinScannerScreen(onVinDetected: (String) -> Unit) {
-    val context = LocalContext.current
-    var hasCameraPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-        )
-    }
-
-    val launcher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-        onResult = { isGranted -> hasCameraPermission = isGranted }
-    )
-
-    LaunchedEffect(Unit) {
-        if (!hasCameraPermission) {
-            launcher.launch(Manifest.permission.CAMERA)
-        }
-    }
-
-    if (hasCameraPermission) {
-        CameraPreviewScanner(onVinDetected = onVinDetected)
-    } else {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Для сканирования VIN нужен доступ к камере")
-        }
-    }
-}
-
-@OptIn(androidx.camera.core.ExperimentalGetImage::class)
-@Composable
-fun CameraPreviewScanner(onVinDetected: (String) -> Unit) {
-    val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
-    var isProcessing by remember { mutableStateOf(false) }
-
-    AndroidView(
-        factory = { ctx ->
-            val previewView = PreviewView(ctx)
-            val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
-
-            cameraProviderFuture.addListener({
-                val cameraProvider = cameraProviderFuture.get()
-                val preview = Preview.Builder().build().also {
-                    it.setSurfaceProvider(previewView.surfaceProvider)
-                }
-
-                val imageAnalysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .build()
-
-                val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-
-                imageAnalysis.setAnalyzer(Executors.newSingleThreadExecutor()) { imageProxy ->
-                    if (isProcessing) {
-                        imageProxy.close()
-                        return@setAnalyzer
-                    }
-
-                    @OptIn(ExperimentalGetImage::class)
-                    val mediaImage = imageProxy.image
-                    if (mediaImage != null) {
-                        val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-                        recognizer.process(image)
-                            .addOnSuccessListener { visionText ->
-                                val vinRegex = Regex("[A-HJ-NPR-Z0-9]{17}")
-                                val match = vinRegex.find(visionText.text.uppercase())
-                                if (match != null) {
-                                    isProcessing = true
-                                    onVinDetected(match.value)
-                                }
-                            }
-                            .addOnCompleteListener {
-                                imageProxy.close()
-                            }
-                    } else {
-                        imageProxy.close()
-                    }
-                }
-
-                val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-                try {
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
-                } catch (e: Exception) {
-                    Log.e("Camera", "Binding failed", e)
-                }
-            }, ContextCompat.getMainExecutor(ctx))
-
-            previewView
-        },
-        modifier = Modifier.fillMaxSize()
-    )
-}
-
-// ==========================================
-// 8. SERVICE HISTORY SCREEN
-// ==========================================
-
-@Composable
-fun ServiceHistoryScreen(
-    viewModel: AutoAssistantViewModel,
-    onBack: () -> Unit
-) {
-    val state by viewModel.uiState.collectAsState()
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = "← Назад",
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier
-                    .clickable { onBack() }
-                    .padding(8.dp)
-            )
-            Spacer(modifier = Modifier.width(16.dp))
-            Text(
-                text = "Журнал ТО",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
-            )
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(state.serviceHistory) { item ->
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-                ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Text(text = item.title, fontWeight = FontWeight.Bold)
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(text = "Дата: ${item.date}", fontSize = 12.sp, color = Color.Gray)
-                            Text(text = "${item.mileageKm} км", fontSize = 12.sp, color = Color.Gray)
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "Стоимость: ${item.cost.toInt()} ₽",
-                            color = MaterialTheme.colorScheme.primary,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ==========================================
-// 9. REUSABLE UI COMPONENTS
-// ==========================================
-
-@Composable
-fun VehicleProfileCard(vehicle: VehicleProfile) {
+fun VehicleProfileCard(vehicle: VehicleEntity) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -581,10 +516,10 @@ fun VehicleProfileCard(vehicle: VehicleProfile) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(text = "Текущий пробег:", style = MaterialTheme.typography.bodyLarge)
+                Text(text = "Текущий пробег (Room DB):", style = MaterialTheme.typography.bodyMedium)
                 Text(
                     text = "${vehicle.currentMileageKm} км",
-                    style = MaterialTheme.typography.titleLarge,
+                    style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -594,31 +529,36 @@ fun VehicleProfileCard(vehicle: VehicleProfile) {
 }
 
 @Composable
-fun ServiceTaskCard(task: ServiceTask, currentMileage: Int) {
-    val kmLeft = task.dueMileageKm - currentMileage
-
+fun ServiceTaskCard(task: ServiceTask) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(text = task.title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
-                Text(text = "Срок до: ${task.dueDate}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = task.title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = "на ${task.dueMileageKm} км",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
             }
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
             Text(
-                text = "через $kmLeft км",
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.error
+                text = "Расходники: ${task.consumables}",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.DarkGray
             )
         }
     }
@@ -674,6 +614,165 @@ fun ExpensesChartCard(expenses: List<CostCategory>) {
                     Text(text = category.categoryName, fontSize = 14.sp)
                     Spacer(modifier = Modifier.weight(1f))
                     Text(text = "${category.amount.toInt()} ₽", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun VinScannerScreen(onVinDetected: (String) -> Unit) {
+    val context = LocalContext.current
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { isGranted -> hasCameraPermission = isGranted }
+    )
+
+    LaunchedEffect(Unit) {
+        if (!hasCameraPermission) {
+            launcher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    if (hasCameraPermission) {
+        CameraPreviewScanner(onVinDetected = onVinDetected)
+    } else {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("Для сканирования VIN нужен доступ к камере")
+        }
+    }
+}
+
+@OptIn(ExperimentalGetImage::class)
+@Composable
+fun CameraPreviewScanner(onVinDetected: (String) -> Unit) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var isProcessing by remember { mutableStateOf(false) }
+
+    AndroidView(
+        factory = { ctx ->
+            val previewView = PreviewView(ctx)
+            val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+
+            cameraProviderFuture.addListener({
+                val cameraProvider = cameraProviderFuture.get()
+                val preview = Preview.Builder().build().also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
+
+                val imageAnalysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+
+                val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+
+                imageAnalysis.setAnalyzer(Executors.newSingleThreadExecutor()) { imageProxy ->
+                    if (isProcessing) {
+                        imageProxy.close()
+                        return@setAnalyzer
+                    }
+
+                    val mediaImage = imageProxy.image
+                    if (mediaImage != null) {
+                        val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+                        recognizer.process(image)
+                            .addOnSuccessListener { visionText ->
+                                val vinRegex = Regex("[A-HJ-NPR-Z0-9]{17}")
+                                val match = vinRegex.find(visionText.text.uppercase())
+                                if (match != null) {
+                                    isProcessing = true
+                                    onVinDetected(match.value)
+                                }
+                            }
+                            .addOnCompleteListener {
+                                imageProxy.close()
+                            }
+                    } else {
+                        imageProxy.close()
+                    }
+                }
+
+                val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                try {
+                    cameraProvider.unbindAll()
+                    cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
+                } catch (e: Exception) {
+                    Log.e("Camera", "Binding failed", e)
+                }
+            }, ContextCompat.getMainExecutor(ctx))
+
+            previewView
+        },
+        modifier = Modifier.fillMaxSize()
+    )
+}
+
+@Composable
+fun ServiceHistoryScreen(
+    viewModel: AutoAssistantViewModel,
+    onBack: () -> Unit
+) {
+    val state by viewModel.uiState.collectAsState()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "← Назад",
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .clickable { onBack() }
+                    .padding(8.dp)
+            )
+            Spacer(modifier = Modifier.width(16.dp))
+            Text(
+                text = "Журнал ТО (Room DB)",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold
+            )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        if (state.serviceHistory.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(text = "Записи о ремонтах отсутствуют в Room DB", color = Color.Gray)
+            }
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(state.serviceHistory) { item ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(text = item.title, fontWeight = FontWeight.Bold)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(text = "Дата: ${item.date}", fontSize = 12.sp, color = Color.Gray)
+                                Text(text = "${item.mileageKm} км", fontSize = 12.sp, color = Color.Gray)
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Стоимость: ${item.cost.toInt()} ₽",
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
                 }
             }
         }
