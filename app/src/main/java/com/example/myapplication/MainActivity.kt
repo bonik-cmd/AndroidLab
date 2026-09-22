@@ -101,7 +101,7 @@ interface VehicleDao {
     suspend fun getHistoryForVehicle(vin: String): List<ServiceHistoryEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertHistoryItem(item: ServiceHistoryEntity)
+    suspend fun insertHistoryItem(item: ServiceHistoryEntity): Long
 }
 
 @Database(entities = [VehicleEntity::class, ServiceHistoryEntity::class], version = 1, exportSchema = false)
@@ -191,6 +191,10 @@ class AutoRepository(
     suspend fun getActiveVehicle(): VehicleEntity? = db.vehicleDao().getActiveVehicle()
 
     suspend fun getHistory(vin: String): List<ServiceHistoryEntity> = db.vehicleDao().getHistoryForVehicle(vin)
+
+    suspend fun addServiceRecord(item: ServiceHistoryEntity) {
+        db.vehicleDao().insertHistoryItem(item)
+    }
 
     suspend fun decodeAndSaveVin(vin: String): VehicleEntity? = withContext(Dispatchers.IO) {
         try {
@@ -328,6 +332,22 @@ class AutoAssistantViewModel(private val repository: AutoRepository) : ViewModel
                     monthlyExpenses = mockExpenses
                 )
             }
+        }
+    }
+
+    fun addServiceRecord(title: String, date: String, mileageKm: Int, cost: Double) {
+        val currentVin = _uiState.value.vehicle?.vin ?: return
+
+        viewModelScope.launch {
+            val newRecord = ServiceHistoryEntity(
+                vehicleVin = currentVin,
+                title = title,
+                date = date,
+                mileageKm = mileageKm,
+                cost = cost
+            )
+            repository.addServiceRecord(newRecord)
+            loadData()
         }
     }
 
@@ -719,27 +739,43 @@ fun ServiceHistoryScreen(
     onBack: () -> Unit
 ) {
     val state by viewModel.uiState.collectAsState()
+    var showAddDialog by remember { mutableStateOf(false) }
+
+    var titleText by remember { mutableStateOf("") }
+    var dateText by remember { mutableStateOf("") }
+    var mileageText by remember { mutableStateOf("") }
+    var costText by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = "← Назад",
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier
-                    .clickable { onBack() }
-                    .padding(8.dp)
-            )
-            Spacer(modifier = Modifier.width(16.dp))
-            Text(
-                text = "Журнал ТО (Room DB)",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
-            )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "← Назад",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier
+                        .clickable { onBack() }
+                        .padding(8.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Журнал ТО",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Button(onClick = { showAddDialog = true }) {
+                Text("+ Добавить")
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -776,5 +812,69 @@ fun ServiceHistoryScreen(
                 }
             }
         }
+    }
+
+    if (showAddDialog) {
+        AlertDialog(
+            onDismissRequest = { showAddDialog = false },
+            title = { Text("Новая запись о ТО") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = titleText,
+                        onValueChange = { titleText = it },
+                        label = { Text("Наименование работ") },
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = dateText,
+                        onValueChange = { dateText = it },
+                        label = { Text("Дата (напр. 25.10.2024)") },
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = mileageText,
+                        onValueChange = { mileageText = it },
+                        label = { Text("Пробег (км)") },
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = costText,
+                        onValueChange = { costText = it },
+                        label = { Text("Стоимость (₽)") },
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val mileage = mileageText.toIntOrNull() ?: 0
+                        val cost = costText.toDoubleOrNull() ?: 0.0
+
+                        if (titleText.isNotBlank()) {
+                            viewModel.addServiceRecord(
+                                title = titleText,
+                                date = dateText.ifBlank { "Сегодня" },
+                                mileageKm = mileage,
+                                cost = cost
+                            )
+                            titleText = ""
+                            dateText = ""
+                            mileageText = ""
+                            costText = ""
+                            showAddDialog = false
+                        }
+                    }
+                ) {
+                    Text("Сохранить")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddDialog = false }) {
+                    Text("Отмена")
+                }
+            }
+        )
     }
 }
